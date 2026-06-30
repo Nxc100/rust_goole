@@ -1,0 +1,4 @@
+# 本项目用 GNU 工具链构建（配套 MinGW-w64），避免依赖 MSVC link.exe。
+# 构建时需保证 MinGW 的 bin 目录在 PATH 中（见 build.ps1）。
+[toolchain]
+channel = "stable-x86_64-pc-windows-gnu"
