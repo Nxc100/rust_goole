@@ -79,9 +79,11 @@ struct App {
     show_window: bool, // 显示浏览器窗口（= !headless）
     overwrite: bool,
     recursive: bool, // 含子目录并复刻目录结构
+    turbo: bool,     // 高效模式：多开浏览器并行
+    concurrency: u32, // 并行浏览器数（高效模式生效）
     timeout_secs: u32,
     chrome_path: String,
-    show_advanced: bool,
+    chrome_found: Option<PathBuf>, // 启动时/重新检测时探测到的 Chrome 路径
 
     autostart: bool,
     started_once: bool,
@@ -94,6 +96,7 @@ struct App {
     done: usize,
     ok: usize,
     failed: usize,
+    active: usize,
     current: String,
     rows: Vec<Row>,
     logs: Vec<String>,
@@ -116,6 +119,11 @@ impl Default for App {
             .and_then(|c| translator::source_langs().iter().position(|(code, _)| *code == c))
             .unwrap_or(0);
         let autostart = std::env::var("GIMG_AUTOSTART").map(|v| v == "1").unwrap_or(false);
+        // GIMG_CONCURRENCY>1 时自动开启高效模式并设并行数
+        let env_conc = std::env::var("GIMG_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|n| *n >= 2);
         Self {
             input: env_path("GIMG_INPUT").filter(|p| p.is_dir()),
             output: env_path("GIMG_OUTPUT"),
@@ -124,9 +132,11 @@ impl Default for App {
             show_window: true,
             overwrite: false,
             recursive: true,
+            turbo: env_conc.is_some(),
+            concurrency: env_conc.unwrap_or(3).clamp(2, 8),
             timeout_secs: 90,
             chrome_path: String::new(),
-            show_advanced: false,
+            chrome_found: translator::find_chrome(&None),
             autostart,
             started_once: false,
             running: false,
@@ -137,6 +147,7 @@ impl Default for App {
             done: 0,
             ok: 0,
             failed: 0,
+            active: 0,
             current: String::new(),
             rows: Vec::new(),
             logs: Vec::new(),
@@ -148,6 +159,15 @@ impl Default for App {
 impl App {
     fn source_langs(&self) -> Vec<(&'static str, &'static str)> {
         translator::source_langs()
+    }
+
+    /// 重新探测 Chrome（考虑高级设置里手填的路径）
+    fn recheck_chrome(&mut self) {
+        let explicit = {
+            let t = self.chrome_path.trim();
+            if t.is_empty() { None } else { Some(PathBuf::from(t)) }
+        };
+        self.chrome_found = translator::find_chrome(&explicit);
     }
 
     fn start(&mut self, ctx: &egui::Context) {
@@ -173,6 +193,7 @@ impl App {
         self.done = 0;
         self.ok = 0;
         self.failed = 0;
+        self.active = 0;
         self.current.clear();
         self.logs.clear();
         self.finished_msg = None;
@@ -188,6 +209,7 @@ impl App {
             headless: !self.show_window,
             overwrite: self.overwrite,
             recursive: self.recursive,
+            concurrency: if self.turbo { self.concurrency.clamp(2, 8) as usize } else { 1 },
             chrome: {
                 let t = self.chrome_path.trim();
                 if t.is_empty() { None } else { Some(PathBuf::from(t)) }
@@ -220,6 +242,7 @@ impl App {
                 Progress::Total(t) => self.total = t,
                 Progress::FileStart { idx, total, name } => {
                     self.total = total;
+                    self.active += 1;
                     self.current = name.clone();
                     if let Some(r) = self.rows.get_mut(idx) {
                         r.status = Status::Running;
@@ -229,6 +252,7 @@ impl App {
                 Progress::FileOk { idx, name, path, bytes, skipped } => {
                     self.done += 1;
                     self.ok += 1;
+                    self.active = self.active.saturating_sub(1);
                     if let Some(r) = self.rows.get_mut(idx) {
                         r.status = if skipped {
                             Status::Skipped
@@ -245,6 +269,7 @@ impl App {
                 Progress::FileErr { idx, name, error } => {
                     self.done += 1;
                     self.failed += 1;
+                    self.active = self.active.saturating_sub(1);
                     if let Some(r) = self.rows.get_mut(idx) {
                         r.status = Status::Failed(error.clone());
                     }
@@ -253,6 +278,7 @@ impl App {
                 Progress::Log(s) => self.logs.push(s),
                 Progress::Done { ok, failed } => {
                     self.running = false;
+                    self.active = 0;
                     self.current.clear();
                     self.finished_msg = Some(format!("完成：成功 {ok}，失败 {failed}（共 {}）", self.total));
                     self.logs.push(format!("==== 完成：成功 {ok}，失败 {failed} ===="));
@@ -307,6 +333,27 @@ impl eframe::App for App {
                     .weak(),
             );
             ui.separator();
+
+            // ---- Chrome 检测状态（启动即检测）----
+            match &self.chrome_found {
+                Some(p) => {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(egui::Color32::from_rgb(40, 160, 70), "✓ 已检测到 Chrome");
+                        ui.label(egui::RichText::new(p.display().to_string()).small().weak());
+                    });
+                }
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(200, 60, 60),
+                            "⚠ 未检测到 Google Chrome —— 请先安装（chrome.com），或在“高级设置”里指定 chrome.exe",
+                        );
+                        if ui.button("重新检测").clicked() {
+                            self.recheck_chrome();
+                        }
+                    });
+                }
+            }
 
             let enabled = !self.running;
 
@@ -376,10 +423,26 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.recursive, "包含子目录（在输出目录复刻相同的目录结构）");
                 });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.turbo, "⚡ 高效模式（多开浏览器并行，更快）");
+                    if self.turbo {
+                        ui.add(egui::Slider::new(&mut self.concurrency, 2..=8).text("并行浏览器数"));
+                    }
+                });
+                if self.turbo {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "将同时开 {} 个浏览器并行翻译；并行数越高越快，但更占资源、过高可能被限流。失败会自动重试 1 次。",
+                            self.concurrency
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                }
 
-                // ---- 高级 ----
+                // ---- 高级 ----（让 egui 自行管理折叠状态，可交互展开/收起）
                 egui::CollapsingHeader::new("高级设置")
-                    .open(Some(self.show_advanced))
+                    .default_open(false)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label("单张超时(秒)");
@@ -387,11 +450,23 @@ impl eframe::App for App {
                         });
                         ui.horizontal(|ui| {
                             ui.label("Chrome 路径");
-                            ui.add(
+                            let resp = ui.add(
                                 egui::TextEdit::singleline(&mut self.chrome_path)
                                     .hint_text("留空=自动探测")
-                                    .desired_width(420.0),
+                                    .desired_width(320.0),
                             );
+                            if ui.button("浏览…").clicked() {
+                                if let Some(f) = rfd::FileDialog::new()
+                                    .add_filter("chrome.exe", &["exe"])
+                                    .pick_file()
+                                {
+                                    self.chrome_path = f.display().to_string();
+                                    self.recheck_chrome();
+                                }
+                            }
+                            if resp.changed() {
+                                self.recheck_chrome();
+                            }
                         });
                     });
             });
@@ -429,7 +504,11 @@ impl eframe::App for App {
                 0.0
             };
             let bar_text = if self.running {
-                format!("{}/{}  {}", self.done, self.total, self.current)
+                if self.active > 1 {
+                    format!("已完成 {}/{} · 并行 {} 个进行中", self.done, self.total, self.active)
+                } else {
+                    format!("{}/{}  {}", self.done, self.total, self.current)
+                }
             } else if let Some(m) = &self.finished_msg {
                 m.clone()
             } else {

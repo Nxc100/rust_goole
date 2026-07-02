@@ -51,6 +51,9 @@ struct Cli {
     /// 只处理顶层目录、不递归子目录（默认递归并复刻子目录结构）
     #[arg(long, default_value_t = false)]
     no_recursive: bool,
+    /// 高效模式：并行浏览器数（多开浏览器同时翻译，1=串行）
+    #[arg(short = 'j', long, default_value_t = 1)]
+    concurrency: usize,
 }
 
 fn main() {
@@ -75,6 +78,7 @@ fn main() {
         headless: cli.headless,
         overwrite: cli.overwrite,
         recursive: !cli.no_recursive,
+        concurrency: cli.concurrency.max(1),
         chrome: cli.chrome,
     };
 

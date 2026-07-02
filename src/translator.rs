@@ -8,16 +8,18 @@ use headless_chrome::{Browser, LaunchOptions, Tab};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 pub const SUPPORTED_EXT: &[&str] = &["jpg", "jpeg", "png", "webp"];
 
 /// 目标语言列表：(代码, 显示名)
+// 显示名只用「中文 + 拉丁/西里尔」，避免系统中文字体缺韩/泰/阿拉伯/印地字形而显示为方块。
 pub const TARGET_LANGS: &[(&str, &str)] = &[
     ("en", "英语 English"),
-    ("ja", "日语 日本語"),
-    ("ko", "韩语 한국어"),
+    ("ja", "日语 Japanese"),
+    ("ko", "韩语 Korean"),
     ("zh-CN", "简体中文"),
     ("zh-TW", "繁体中文"),
     ("de", "德语 Deutsch"),
@@ -26,11 +28,11 @@ pub const TARGET_LANGS: &[(&str, &str)] = &[
     ("ru", "俄语 Русский"),
     ("it", "意大利语 Italiano"),
     ("pt", "葡萄牙语 Português"),
-    ("th", "泰语 ไทย"),
-    ("vi", "越南语 Tiếng Việt"),
-    ("ar", "阿拉伯语 العربية"),
-    ("id", "印尼语 Indonesia"),
-    ("hi", "印地语 हिन्दी"),
+    ("th", "泰语 Thai"),
+    ("vi", "越南语 Vietnamese"),
+    ("ar", "阿拉伯语 Arabic"),
+    ("id", "印尼语 Indonesian"),
+    ("hi", "印地语 Hindi"),
 ];
 
 /// 源语言列表：auto + 目标语言列表
@@ -52,6 +54,8 @@ pub struct Config {
     pub chrome: Option<PathBuf>,
     /// 递归处理子目录，并在输出目录复刻同样的子目录结构
     pub recursive: bool,
+    /// 并行浏览器数（高效模式）。1=串行单浏览器；>1=多开浏览器并行。
+    pub concurrency: usize,
 }
 
 /// 进度事件，上报给 UI / 控制台
@@ -179,74 +183,162 @@ pub fn run_batch(cfg: &Config, cancel: &AtomicBool, mut on: impl FnMut(Progress)
         return;
     }
 
+    let conc = cfg.concurrency.clamp(1, 8).min(total);
     on(Progress::Log(format!(
-        "启动 Chrome（{}）...",
+        "启动 {} 个浏览器（{}）...",
+        conc,
         if cfg.headless { "无头" } else { "可见窗口" }
     )));
-    let browser = match launch_browser(cfg) {
-        Ok(b) => b,
-        Err(e) => {
-            on(Progress::Fatal(format!("启动 Chrome 失败：{e}")));
-            return;
+
+    // 启动 conc 个独立浏览器实例（高效模式下并行使用）
+    let mut browsers: Vec<Browser> = Vec::new();
+    for k in 0..conc {
+        match launch_browser(cfg) {
+            Ok(b) => browsers.push(b),
+            Err(e) => {
+                on(Progress::Fatal(format!("启动第 {} 个 Chrome 失败：{e}", k + 1)));
+                return; // 已启动的浏览器在此 drop 关闭
+            }
         }
-    };
-    let tab = match browser.new_tab() {
-        Ok(t) => t,
-        Err(e) => {
-            on(Progress::Fatal(format!("创建标签页失败：{e}")));
-            return;
-        }
-    };
+    }
+
+    let images_ref: &[PathBuf] = &images;
+    let next = AtomicUsize::new(0);
+    let next_ref = &next;
+    let (tx, rx) = std::sync::mpsc::channel::<Progress>();
 
     let mut ok = 0usize;
     let mut failed = 0usize;
 
-    for (i, img) in images.iter().enumerate() {
+    // 并发：每个浏览器一个 worker 线程，从共享原子计数取下一张图；
+    // 主线程异步收集各 worker 的进度并回调上报。
+    std::thread::scope(|s| {
+        for browser in browsers {
+            let txc = tx.clone();
+            s.spawn(move || worker(browser, images_ref, next_ref, cfg, cancel, txc));
+        }
+        drop(tx); // 关闭原始发送端：所有 worker 结束后 rx.recv 返回 Err，退出收集循环
+
+        while let Ok(p) = rx.recv() {
+            match &p {
+                Progress::FileOk { .. } => ok += 1,
+                Progress::FileErr { .. } => failed += 1,
+                _ => {}
+            }
+            on(p);
+        }
+    });
+
+    on(Progress::Done { ok, failed });
+}
+
+/// 单个 worker：独占一个浏览器，循环从共享队列取图翻译，完成后关闭浏览器。
+fn worker(
+    browser: Browser,
+    images: &[PathBuf],
+    next: &AtomicUsize,
+    cfg: &Config,
+    cancel: &AtomicBool,
+    tx: Sender<Progress>,
+) {
+    let tab = match browser.new_tab() {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = tx.send(Progress::Log(format!("创建标签页失败：{e}")));
+            return;
+        }
+    };
+    let total = images.len();
+    loop {
         if cancel.load(Ordering::Relaxed) {
-            on(Progress::Log("已被用户停止。".into()));
             break;
         }
-        // 相对路径（用于展示，并在输出目录复刻同样的子目录结构）
+        let i = next.fetch_add(1, Ordering::Relaxed);
+        if i >= total {
+            break;
+        }
+        let img = &images[i];
         let rel = img.strip_prefix(&cfg.input).unwrap_or(img.as_path());
         let name = rel.to_string_lossy().to_string();
-        on(Progress::FileStart { idx: i, total, name: name.clone() });
+        let _ = tx.send(Progress::FileStart { idx: i, total, name: name.clone() });
 
         let out_path = cfg.output.join(rel);
         if out_path.exists() && !cfg.overwrite {
-            ok += 1;
-            on(Progress::FileOk { idx: i, name, path: out_path, bytes: 0, skipped: true });
+            let _ = tx.send(Progress::FileOk { idx: i, name, path: out_path, bytes: 0, skipped: true });
             continue;
         }
         // 确保输出子目录存在
         if let Some(parent) = out_path.parent() {
             if let Err(e) = fs::create_dir_all(parent) {
-                failed += 1;
-                on(Progress::FileErr { idx: i, name, error: format!("创建输出子目录失败: {e}") });
+                let _ = tx.send(Progress::FileErr { idx: i, name, error: format!("创建输出子目录失败: {e}") });
                 continue;
             }
         }
 
-        match translate_one(&tab, &cfg.source, &cfg.target, img, cfg.timeout) {
+        match translate_with_retry(&tab, cfg, img, 1) {
             Ok(bytes) => match fs::write(&out_path, &bytes) {
                 Ok(_) => {
-                    ok += 1;
-                    on(Progress::FileOk { idx: i, name, path: out_path, bytes: bytes.len(), skipped: false });
+                    let _ = tx.send(Progress::FileOk { idx: i, name, path: out_path, bytes: bytes.len(), skipped: false });
                 }
                 Err(e) => {
-                    failed += 1;
-                    on(Progress::FileErr { idx: i, name, error: format!("保存失败: {e}") });
+                    let _ = tx.send(Progress::FileErr { idx: i, name, error: format!("保存失败: {e}") });
                 }
             },
             Err(e) => {
-                failed += 1;
-                on(Progress::FileErr { idx: i, name, error: format!("{e}") });
+                let _ = tx.send(Progress::FileErr { idx: i, name, error: format!("{e}") });
             }
         }
 
-        std::thread::sleep(Duration::from_millis(800));
+        std::thread::sleep(Duration::from_millis(400));
     }
+    drop(tab);
+    drop(browser); // 关闭该 worker 的 Chrome 进程
+}
 
-    on(Progress::Done { ok, failed });
+/// 翻译并在失败时重试，保证质量（高效模式并发下偶发超时可自愈）。
+fn translate_with_retry(tab: &Tab, cfg: &Config, img: &PathBuf, retries: u32) -> Result<Vec<u8>> {
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 0..=retries {
+        match translate_one(tab, &cfg.source, &cfg.target, img, cfg.timeout) {
+            Ok(b) => return Ok(b),
+            Err(e) => {
+                last = Some(e);
+                if attempt < retries {
+                    std::thread::sleep(Duration::from_millis(700));
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("未知错误")))
+}
+
+/// 探测本机 Google Chrome 可执行文件。优先用显式指定的路径，其次常见安装位置。
+/// 返回 None 表示没找到（可据此在界面提示用户安装或手动指定）。
+pub fn find_chrome(explicit: &Option<PathBuf>) -> Option<PathBuf> {
+    // 1) 用户显式指定
+    if let Some(p) = explicit {
+        if p.is_file() {
+            return Some(p.clone());
+        }
+    }
+    // 2) 环境变量 CHROME
+    if let Ok(p) = std::env::var("CHROME") {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    // 3) 常见安装位置（系统级 / 用户级）
+    let suffix = r"Google\Chrome\Application\chrome.exe";
+    for env in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA", "ProgramW6432"] {
+        if let Ok(base) = std::env::var(env) {
+            let c = PathBuf::from(base).join(suffix);
+            if c.is_file() {
+                return Some(c);
+            }
+        }
+    }
+    None
 }
 
 fn launch_browser(cfg: &Config) -> Result<Browser> {
@@ -264,11 +356,13 @@ fn launch_browser(cfg: &Config) -> Result<Browser> {
         .idle_browser_timeout(Duration::from_secs(3600))
         .window_size(Some((1280, 1000)))
         .args(arg_refs);
-    if let Some(ref p) = cfg.chrome {
-        builder.path(Some(p.clone()));
+    // 用探测到的 Chrome 路径（比库自带探测更可靠）；探测不到则交给库兜底
+    if let Some(p) = find_chrome(&cfg.chrome) {
+        builder.path(Some(p));
     }
     let options = builder.build().map_err(|e| anyhow!("构造启动参数失败: {e}"))?;
-    Browser::new(options).context("请确认已安装 Chrome 或在高级设置里指定路径")
+    Browser::new(options)
+        .context("无法启动 Chrome：请确认已安装 Google Chrome，或在“高级设置”里指定 chrome.exe 路径")
 }
 
 /// 翻译单张图片，返回翻译后图片字节。
